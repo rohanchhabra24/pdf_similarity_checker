@@ -1,6 +1,43 @@
-import sys, os, re
+#!/usr/bin/env python3
+"""
+compare_pdfs_fullmatrix.py
+
+Usage:
+    python compare_pdfs_fullmatrix.py path/to/doc_A.pdf path/to/doc_B.pdf
+
+Requirements:
+    pip install google-genai PyPDF2 pandas scikit-learn numpy python-dotenv
+
+Set credentials:
+    - Create a .env file in the project folder with:
+        GOOGLE_API_KEY=your_key_here
+      OR set GOOGLE_APPLICATION_CREDENTIALS for a service account JSON.
+
+This script:
+ - extracts text from two PDFs,
+ - splits into paragraphs and sentence-chunks,
+ - attempts to embed chunks with Gemini embeddings (gemini-embedding-001),
+ - if embeddings fail, falls back to TF-IDF,
+ - aggregates chunk similarities to get paragraph-level N x M matrix,
+ - writes CSV reports to comparison_output/.
+"""
+
+import sys
+import os
+import re
+import time
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
+
+# load env from .env if present
+load_dotenv()
+
+# import Gemini SDK
+from google import genai
+
+# initialize Gemini client (it will use GOOGLE_API_KEY or GOOGLE_APPLICATION_CREDENTIALS)
+genai_client = genai.Client()
 
 # ---------- PDF text extraction ----------
 def extract_text_from_pdf_pypdf2(path):
@@ -16,23 +53,20 @@ def extract_text_from_pdf_pypdf2(path):
 
 # ---------- paragraph splitting (robust) ----------
 def split_paragraphs(text):
-    # Normalize newlines
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    # First attempt: split on two or more newlines
+    # try blank-lines first
     paras = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
     if len(paras) > 1:
         return paras
 
-    # If PDF had no blank lines, split by single newlines but group contiguous non-empty lines
+    # otherwise group lines heuristically
     lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
     if len(lines) > 1:
         grouped = []
         current = []
         for ln in lines:
             current.append(ln)
-            # Heuristic: if line ends with punctuation, treat it as end of small paragraph with some probability
             if re.search(r'[.!?;:]$', ln):
-                # keep grouping small amount; we use short grouping to avoid huge paras
                 if len(current) >= 1:
                     grouped.append(" ".join(current))
                     current = []
@@ -41,12 +75,11 @@ def split_paragraphs(text):
         if len(grouped) > 1:
             return grouped
 
-    # Final fallback: split into pseudo-paragraphs by sentences (rough grouping)
+    # fallback: group every N sentences
     sents = re.split(r'(?<=[.!?;])\s+', text)
     sents = [s.strip() for s in sents if s.strip()]
-    if len(sents) == 0:
+    if not sents:
         return [text.strip()]
-    # Group every n sentences into a paragraph (n=3)
     n = 3
     paras = []
     for i in range(0, len(sents), n):
@@ -65,7 +98,6 @@ def chunk_paragraphs(paragraphs):
     for pi, p in enumerate(paragraphs):
         sents = split_sentences(p)
         if not sents:
-            # treat whole paragraph as one chunk
             chunks.append(p)
             chunk_map.append({'para_idx': pi, 'chunk_idx': 0, 'text': p})
         else:
@@ -74,22 +106,45 @@ def chunk_paragraphs(paragraphs):
                 chunk_map.append({'para_idx': pi, 'chunk_idx': ci, 'text': s})
     return chunks, chunk_map
 
-# ---------- embeddings / similarity ----------
-def try_load_sentence_transformer():
-    try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        return model
-    except Exception:
-        return None
+# ---------- Gemini embedding helper ----------
+def embed_with_gemini(chunks, model="gemini-embedding-001", batch_size=64, sleep_sec=0.08):
+    """
+    Embed a list of strings using Gemini embeddings (google-genai).
+    Returns a NumPy array of normalized embeddings (unit vectors).
+    """
+    embeddings = []
+    if not chunks:
+        return np.zeros((0, 0), dtype=np.float32)
 
-def compute_semantic_similarity(A_chunks, B_chunks, model):
-    # model.encode(..., normalize_embeddings=True) available in recent versions
-    A_emb = model.encode(A_chunks, convert_to_numpy=True, normalize_embeddings=True)
-    B_emb = model.encode(B_chunks, convert_to_numpy=True, normalize_embeddings=True)
-    sim = np.dot(A_emb, B_emb.T)  # cosine because normalized
-    return sim
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i+batch_size]
+        result = genai_client.models.embed_content(model=model, contents=batch)
+        # Parse result — handle SDK variants:
+        if hasattr(result, "embeddings") and result.embeddings is not None:
+            batch_embs = [e.values for e in result.embeddings]
+        else:
+            batch_embs = []
+            try:
+                for item in result:
+                    if isinstance(item, dict) and "embedding" in item:
+                        batch_embs.append(item["embedding"])
+                    elif hasattr(item, "values"):
+                        batch_embs.append(item.values)
+                    else:
+                        raise RuntimeError("Unexpected embedding response.")
+            except Exception as e:
+                raise RuntimeError("Failed to parse embedding response: " + str(e))
+        embeddings.extend(batch_embs)
+        time.sleep(sleep_sec)
 
+    arr = np.array(embeddings, dtype=np.float32)
+    # normalize to unit vectors
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-9
+    arr = arr / norms
+    return arr
+
+# ---------- TF-IDF fallback ----------
 def compute_tfidf_similarity(A_chunks, B_chunks):
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -105,7 +160,6 @@ def compute_tfidf_similarity(A_chunks, B_chunks):
 def aggregate_to_paragraph_level(chunk_sim, A_map, B_map, num_A_para, num_B_para):
     para_sim = np.zeros((num_A_para, num_B_para))
     evidence = [[None]*num_B_para for _ in range(num_A_para)]
-    # For producing a detailed all_chunk_matches list
     all_matches = []
 
     for a_idx, a_m in enumerate(A_map):
@@ -113,14 +167,12 @@ def aggregate_to_paragraph_level(chunk_sim, A_map, B_map, num_A_para, num_B_para
             sim = float(chunk_sim[a_idx, b_idx])
             pa = a_m['para_idx']
             pb = b_m['para_idx']
-            # store detailed row for potential inspection
             all_matches.append({
                 'A_para': pa+1, 'B_para': pb+1,
                 'A_chunk_idx': a_m['chunk_idx'], 'B_chunk_idx': b_m['chunk_idx'],
                 'A_chunk_text': a_m['text'], 'B_chunk_text': b_m['text'],
                 'similarity': round(sim*100, 4)
             })
-            # update max for paragraph pair (we want max evidence)
             if sim > para_sim[pa, pb]:
                 para_sim[pa, pb] = sim
                 evidence[pa][pb] = {
@@ -146,17 +198,19 @@ def main(pdfA, pdfB):
     B_chunks, B_map = chunk_paragraphs(parasB)
     print(f"Chunks: A={len(A_chunks)}, B={len(B_chunks)}")
 
-    if len(A_chunks)==0 or len(B_chunks)==0:
+    if len(A_chunks) == 0 or len(B_chunks) == 0:
         print("No chunks found; exiting.")
         return
 
-    # 4. similarity
-    model = try_load_sentence_transformer()
-    if model:
-        print("Using semantic embeddings (sentence-transformers).")
-        chunk_sim = compute_semantic_similarity(A_chunks, B_chunks, model)
-    else:
-        print("Sentence-transformers not available; using TF-IDF fallback.")
+    # 4. similarity - try Gemini embeddings first, fallback to TF-IDF
+    try:
+        print("Attempting Gemini embeddings...")
+        A_emb = embed_with_gemini(A_chunks, model="gemini-embedding-001", batch_size=64)
+        B_emb = embed_with_gemini(B_chunks, model="gemini-embedding-001", batch_size=64)
+        chunk_sim = np.dot(A_emb, B_emb.T)  # cosine because normalized
+        print("Gemini embeddings succeeded.")
+    except Exception as e:
+        print("Gemini embedding failed, falling back to TF-IDF. Error:", e)
         chunk_sim = compute_tfidf_similarity(A_chunks, B_chunks)
 
     # 5. aggregate
@@ -184,7 +238,7 @@ def main(pdfA, pdfB):
         best_rows.append({
             'A_paragraph': f"A_para_{i+1}",
             'Best_matching_B_paragraph': f"B_para_{j+1}",
-            'Similarity_%': float(para_percent[i,j]),
+            'Similarity_%': float(para_percent[i, j]),
             'A_chunk_excerpt': ev['A_chunk_text'] if ev else '',
             'B_chunk_excerpt': ev['B_chunk_text'] if ev else ''
         })
