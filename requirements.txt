@@ -3,3 +3,4 @@ pandas
 scikit-learn
 PyPDF2
 sentence-transformers
+google-genai
